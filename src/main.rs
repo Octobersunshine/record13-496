@@ -1,7 +1,8 @@
 mod moderation;
+mod user_tracker;
 
 use axum::{
-    extract::State,
+    extract::{Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
@@ -14,8 +15,9 @@ use thiserror::Error;
 use tokio::sync::Semaphore;
 use tracing::{info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+use user_tracker::{UserAction, UserActionRequest, UserStatus, UserViolationTracker};
 
-use moderation::{ModerationResult, ViolationType};
+use moderation::ModerationResult;
 
 #[derive(Debug, Error)]
 enum AppError {
@@ -78,7 +80,7 @@ struct GroupChatMessage {
     timestamp: Option<i64>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct ModerationResponse {
     group_id: String,
     user_id: String,
@@ -90,7 +92,7 @@ struct ModerationResponse {
     processed_at: i64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct ViolationInfo {
     violation_type: String,
     violation_type_name: String,
@@ -124,6 +126,7 @@ struct AppState {
     version: String,
     max_concurrency: usize,
     chunk_size: usize,
+    user_tracker: Arc<UserViolationTracker>,
 }
 
 fn get_current_timestamp() -> i64 {
@@ -172,6 +175,7 @@ async fn health_check(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 }
 
 async fn moderate_single(
+    State(state): State<Arc<AppState>>,
     Json(msg): Json<GroupChatMessage>,
 ) -> Result<impl IntoResponse, AppError> {
     if msg.content.is_empty() {
@@ -192,12 +196,31 @@ async fn moderate_single(
     );
 
     let result = moderation::moderate_message(&msg.content);
+    let now = get_current_timestamp();
 
     if result.is_violation {
         warn!(
             "检测到违规消息 - 群ID: {}, 用户: {}, 风险分: {}, 建议: {:?}",
             msg.group_id, msg.user_id, result.risk_score, result.suggestion
         );
+
+        let new_status = state.user_tracker
+            .record_violation(
+                &msg.user_id,
+                msg.user_name.as_deref(),
+                &msg.group_id,
+                &msg.content,
+                &result,
+                now,
+            )
+            .await;
+
+        if new_status != UserStatus::Normal {
+            warn!(
+                "用户状态变更 - 用户: {}, 新状态: {:?}",
+                msg.user_id, new_status
+            );
+        }
     }
 
     let response = build_moderation_response(&msg, &result);
@@ -247,30 +270,45 @@ async fn moderate_batch(
                 for (offset, msg) in chunk.iter().enumerate() {
                     let result = moderation::moderate_message(&msg.content);
                     let global_idx = chunk_idx * chunk_size + offset;
-                    chunk_results.push((global_idx, build_moderation_response(msg, &result), result.is_violation));
+                    chunk_results.push((global_idx, build_moderation_response(msg, &result), result.is_violation, msg.clone(), result));
                 }
                 chunk_results
             }
         })
         .buffer_unordered(state.max_concurrency);
 
-    let mut indexed_results: Vec<(usize, ModerationResponse, bool)> = Vec::with_capacity(valid_count);
+    let mut indexed_results: Vec<(usize, ModerationResponse, bool, GroupChatMessage, ModerationResult)> = Vec::with_capacity(valid_count);
     while let Some(chunk_results) = result_stream.next().await {
         indexed_results.extend(chunk_results);
     }
 
-    indexed_results.sort_by_key(|(idx, _, _)| *idx);
+    indexed_results.sort_by_key(|(idx, _, _, _, _)| *idx);
 
+    let now = get_current_timestamp();
     let mut violation_count = 0;
+
     let results: Vec<ModerationResponse> = indexed_results
-        .into_iter()
-        .map(|(_, resp, is_v)| {
-            if is_v {
+        .iter()
+        .map(|(_, resp, is_v, _, _)| {
+            if *is_v {
                 violation_count += 1;
             }
-            resp
+            resp.clone()
         })
         .collect();
+
+    for (_, _, is_v, msg, result) in &indexed_results {
+        if *is_v {
+            state.user_tracker.record_violation(
+                &msg.user_id,
+                msg.user_name.as_deref(),
+                &msg.group_id,
+                &msg.content,
+                result,
+                now,
+            ).await;
+        }
+    }
 
     let duration_ms = start.elapsed().as_millis() as u64;
 
@@ -340,12 +378,86 @@ async fn violation_types() -> impl IntoResponse {
     Json(ApiResponse::success(types))
 }
 
+#[derive(Debug, Deserialize)]
+struct ViolationUsersQuery {
+    min_violations: Option<u32>,
+    status: Option<String>,
+}
+
+async fn list_violation_users(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<ViolationUsersQuery>,
+) -> Result<impl IntoResponse, AppError> {
+    let min_violations = params.min_violations.unwrap_or(1);
+
+    if let Some(status_filter) = &params.status {
+        let status = match status_filter.as_str() {
+            "warned" => UserStatus::Warned,
+            "muted" => UserStatus::Muted,
+            "banned" => UserStatus::Banned,
+            "normal" => UserStatus::Normal,
+            _ => return Err(AppError::BadRequest(format!("无效的状态过滤: {}", status_filter))),
+        };
+        let users = state.user_tracker.get_users_by_status(status).await;
+        let filtered: Vec<user_tracker::ViolationUserSummary> = users
+            .into_iter()
+            .filter(|u| u.violation_count >= min_violations)
+            .collect();
+        let total = filtered.len();
+        return Ok(Json(ApiResponse::success(user_tracker::ViolationUserListResponse {
+            users: filtered,
+            total,
+        })));
+    }
+
+    let result = state.user_tracker.get_violation_users(min_violations).await;
+    Ok(Json(ApiResponse::success(result)))
+}
+
+async fn get_user_violations(
+    State(state): State<Arc<AppState>>,
+    Path(user_id): Path<String>,
+) -> Result<impl IntoResponse, AppError> {
+    let user = state.user_tracker.get_user(&user_id).await;
+    match user {
+        Some(info) => Ok(Json(ApiResponse::success(info))),
+        None => Err(AppError::BadRequest(format!("用户 {} 无违规记录", user_id))),
+    }
+}
+
+async fn apply_user_action(
+    State(state): State<Arc<AppState>>,
+    Path(user_id): Path<String>,
+    Json(req): Json<UserActionRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    let now = get_current_timestamp();
+    let result = state
+        .user_tracker
+        .apply_action(&user_id, req.action, req.reason.as_deref(), now)
+        .await
+        .map_err(|e| AppError::BadRequest(e))?;
+
+    info!("用户管控操作 - 用户: {}, 动作: {:?}, 新状态: {:?}", user_id, req.action, result.status);
+    Ok(Json(ApiResponse::success(result)))
+}
+
+async fn get_user_statistics(
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    let stats = state.user_tracker.get_statistics().await;
+    Json(ApiResponse::success(stats))
+}
+
 fn create_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/health", get(health_check))
         .route("/api/v1/moderate", post(moderate_single))
         .route("/api/v1/moderate/batch", post(moderate_batch))
         .route("/api/v1/violation-types", get(violation_types))
+        .route("/api/v1/users/violations", get(list_violation_users))
+        .route("/api/v1/users/stats", get(get_user_statistics))
+        .route("/api/v1/users/{user_id}/violations", get(get_user_violations))
+        .route("/api/v1/users/{user_id}/action", post(apply_user_action))
         .with_state(state)
 }
 
@@ -370,12 +482,35 @@ async fn main() {
         .and_then(|v| v.parse().ok())
         .unwrap_or_else(|| 32);
 
+    let warning_threshold = std::env::var("MOD_WARNING_THRESHOLD")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2);
+
+    let mute_threshold = std::env::var("MOD_MUTE_THRESHOLD")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(5);
+
+    let ban_threshold = std::env::var("MOD_BAN_THRESHOLD")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10);
+
     info!("系统配置 - CPU核心: {}, 最大并发: {}, 分块大小: {}", cpu_cores, max_concurrency, chunk_size);
+    info!("用户管控阈值 - 警告: {}次, 禁言: {}次, 封禁: {}次", warning_threshold, mute_threshold, ban_threshold);
+
+    let user_tracker = Arc::new(UserViolationTracker::new(
+        warning_threshold,
+        mute_threshold,
+        ban_threshold,
+    ));
 
     let state = Arc::new(AppState {
         version: "0.1.0".to_string(),
         max_concurrency,
         chunk_size,
+        user_tracker,
     });
 
     let app = create_router(state);
@@ -387,7 +522,9 @@ async fn main() {
     info!("群聊消息审核服务启动，监听端口: 3000");
     info!("健康检查: http://localhost:3000/health");
     info!("审核接口: POST http://localhost:3000/api/v1/moderate");
-    info!("批量审核: POST http://localhost:3000/api/v1/moderate/batch (支持最多5000条/次，并发处理)");
+    info!("批量审核: POST http://localhost:3000/api/v1/moderate/batch");
+    info!("违规用户: GET http://localhost:3000/api/v1/users/violations");
+    info!("用户统计: GET http://localhost:3000/api/v1/users/stats");
 
     axum::serve(listener, app)
         .await
@@ -409,6 +546,7 @@ mod tests {
             version: "test".to_string(),
             max_concurrency: 8,
             chunk_size: 16,
+            user_tracker: Arc::new(UserViolationTracker::new(2, 5, 10)),
         })
     }
 
@@ -651,5 +789,149 @@ mod tests {
         let body: ApiResponse<BatchModerationResponse> = serde_json::from_slice(&body).unwrap();
         let data = body.data.unwrap();
         assert_eq!(data.total, 1);
+    }
+
+    #[tokio::test]
+    async fn test_user_violation_tracking() {
+        let state = test_state();
+        let tracker = &state.user_tracker;
+
+        let result = moderation::moderate_message("加微信abc免费领取");
+        assert!(result.is_violation);
+
+        let status = tracker.record_violation(
+            "user_bad", Some("违规用户"), "group1", "加微信abc免费领取", &result, 1000,
+        ).await;
+
+        assert_eq!(status, UserStatus::Normal);
+
+        let user = tracker.get_user("user_bad").await.unwrap();
+        assert_eq!(user.violation_count, 1);
+        assert_eq!(user.records.len(), 1);
+
+        let status2 = tracker.record_violation(
+            "user_bad", None, "group1", "加微信abc免费领取", &result, 2000,
+        ).await;
+
+        assert_eq!(status2, UserStatus::Warned);
+    }
+
+    #[tokio::test]
+    async fn test_user_status_escalation() {
+        let state = test_state();
+        let tracker = &state.user_tracker;
+
+        let result = moderation::moderate_message("赌博中奖汇款");
+
+        for i in 0..2 {
+            tracker.record_violation("escal_user", None, "g1", "赌博中奖汇款", &result, 1000 + i).await;
+        }
+        let user = tracker.get_user("escal_user").await.unwrap();
+        assert_eq!(user.status, UserStatus::Warned);
+
+        for i in 2..5 {
+            tracker.record_violation("escal_user", None, "g1", "赌博中奖汇款", &result, 2000 + i).await;
+        }
+        let user = tracker.get_user("escal_user").await.unwrap();
+        assert_eq!(user.status, UserStatus::Muted);
+
+        for i in 5..10 {
+            tracker.record_violation("escal_user", None, "g1", "赌博中奖汇款", &result, 3000 + i).await;
+        }
+        let user = tracker.get_user("escal_user").await.unwrap();
+        assert_eq!(user.status, UserStatus::Banned);
+    }
+
+    #[tokio::test]
+    async fn test_list_violation_users() {
+        let state = test_state();
+        let tracker = &state.user_tracker;
+
+        let result = moderation::moderate_message("加微信abc免费领取");
+        tracker.record_violation("u1", None, "g1", "加微信abc免费领取", &result, 1000).await;
+        tracker.record_violation("u2", None, "g1", "加微信abc免费领取", &result, 1000).await;
+        tracker.record_violation("u2", None, "g1", "加微信abc免费领取", &result, 2000).await;
+
+        let list = tracker.get_violation_users(1).await;
+        assert_eq!(list.total, 2);
+
+        let list = tracker.get_violation_users(2).await;
+        assert_eq!(list.total, 1);
+        assert_eq!(list.users[0].user_id, "u2");
+    }
+
+    #[tokio::test]
+    async fn test_apply_user_action() {
+        let state = test_state();
+        let tracker = &state.user_tracker;
+
+        let result = moderation::moderate_message("加微信abc免费领取");
+        tracker.record_violation("action_user", None, "g1", "加微信abc免费领取", &result, 1000).await;
+
+        let user = tracker.apply_action("action_user", UserAction::Mute, Some("手动禁言".into()), 2000).await.unwrap();
+        assert_eq!(user.status, UserStatus::Muted);
+
+        let user = tracker.apply_action("action_user", UserAction::Unmute, None, 3000).await.unwrap();
+        assert_eq!(user.status, UserStatus::Normal);
+
+        let user = tracker.apply_action("action_user", UserAction::Reset, None, 4000).await.unwrap();
+        assert_eq!(user.status, UserStatus::Normal);
+        assert_eq!(user.violation_count, 0);
+    }
+
+    #[tokio::test]
+    async fn test_user_statistics() {
+        let state = test_state();
+        let tracker = &state.user_tracker;
+
+        let result = moderation::moderate_message("加微信abc免费领取");
+
+        tracker.record_violation("stat_u1", None, "g1", "加微信abc免费领取", &result, 1000).await;
+        tracker.record_violation("stat_u2", None, "g1", "加微信abc免费领取", &result, 1000).await;
+        tracker.record_violation("stat_u2", None, "g1", "加微信abc免费领取", &result, 2000).await;
+
+        let stats = tracker.get_statistics().await;
+        assert_eq!(stats.total_tracked_users, 2);
+        assert_eq!(stats.users_with_violations, 2);
+    }
+
+    #[tokio::test]
+    async fn test_violation_users_api() {
+        let app = create_router(test_state());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/v1/users/violations?min_violations=1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_user_stats_api() {
+        let app = create_router(test_state());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/v1/users/stats")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body: ApiResponse<user_tracker::UserStatistics> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body.code, 200);
     }
 }
