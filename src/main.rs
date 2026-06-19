@@ -7,9 +7,11 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use futures::stream::{self, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use thiserror::Error;
+use tokio::sync::Semaphore;
 use tracing::{info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -108,6 +110,7 @@ struct BatchModerationResponse {
     results: Vec<ModerationResponse>,
     total: usize,
     violation_count: usize,
+    duration_ms: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -119,6 +122,8 @@ struct HealthResponse {
 
 struct AppState {
     version: String,
+    max_concurrency: usize,
+    chunk_size: usize,
 }
 
 fn get_current_timestamp() -> i64 {
@@ -200,35 +205,89 @@ async fn moderate_single(
 }
 
 async fn moderate_batch(
+    State(state): State<Arc<AppState>>,
     Json(req): Json<BatchModerationRequest>,
 ) -> Result<impl IntoResponse, AppError> {
     if req.messages.is_empty() {
         return Err(AppError::BadRequest("消息列表不能为空".to_string()));
     }
-    if req.messages.len() > 100 {
-        return Err(AppError::BadRequest("单次最多审核100条消息".to_string()));
+    if req.messages.len() > 5000 {
+        return Err(AppError::BadRequest("单次最多审核5000条消息".to_string()));
     }
 
-    info!("批量审核 - 消息数量: {}", req.messages.len());
+    let start = std::time::Instant::now();
+    let total_messages = req.messages.len();
+    info!("批量审核开始 - 消息数量: {}, 并发度: {}, 分块: {}",
+          total_messages, state.max_concurrency, state.chunk_size);
 
-    let mut results = Vec::with_capacity(req.messages.len());
+    let semaphore = Arc::new(Semaphore::new(state.max_concurrency));
+    let chunk_size = state.chunk_size;
+
+    let messages: Vec<GroupChatMessage> = req.messages
+        .into_iter()
+        .filter(|m| !m.content.is_empty())
+        .collect();
+
+    let valid_count = messages.len();
+
+    let chunks: Vec<Vec<GroupChatMessage>> = messages
+        .chunks(chunk_size)
+        .map(|c| c.to_vec())
+        .collect();
+
+    info!("分块数量: {}, 每块约 {} 条", chunks.len(), chunk_size);
+
+    let semaphore_clone = semaphore.clone();
+    let mut result_stream = stream::iter(chunks.into_iter().enumerate())
+        .map(|(chunk_idx, chunk)| {
+            let permit = semaphore_clone.clone().acquire_owned();
+            async move {
+                let _permit = permit.await.expect("信号量已关闭");
+                let mut chunk_results = Vec::with_capacity(chunk.len());
+                for (offset, msg) in chunk.iter().enumerate() {
+                    let result = moderation::moderate_message(&msg.content);
+                    let global_idx = chunk_idx * chunk_size + offset;
+                    chunk_results.push((global_idx, build_moderation_response(msg, &result), result.is_violation));
+                }
+                chunk_results
+            }
+        })
+        .buffer_unordered(state.max_concurrency);
+
+    let mut indexed_results: Vec<(usize, ModerationResponse, bool)> = Vec::with_capacity(valid_count);
+    while let Some(chunk_results) = result_stream.next().await {
+        indexed_results.extend(chunk_results);
+    }
+
+    indexed_results.sort_by_key(|(idx, _, _)| *idx);
+
     let mut violation_count = 0;
+    let results: Vec<ModerationResponse> = indexed_results
+        .into_iter()
+        .map(|(_, resp, is_v)| {
+            if is_v {
+                violation_count += 1;
+            }
+            resp
+        })
+        .collect();
 
-    for msg in &req.messages {
-        if msg.content.is_empty() {
-            continue;
-        }
-        let result = moderation::moderate_message(&msg.content);
-        if result.is_violation {
-            violation_count += 1;
-        }
-        results.push(build_moderation_response(msg, &result));
-    }
+    let duration_ms = start.elapsed().as_millis() as u64;
+
+    info!(
+        "批量审核完成 - 总数: {}, 有效: {}, 违规: {}, 耗时: {}ms, 平均: {:.2}ms/条",
+        total_messages,
+        valid_count,
+        violation_count,
+        duration_ms,
+        if valid_count > 0 { duration_ms as f64 / valid_count as f64 } else { 0.0 }
+    );
 
     let response = BatchModerationResponse {
         total: results.len(),
         violation_count,
         results,
+        duration_ms,
     };
 
     Ok(Json(ApiResponse::success(response)))
@@ -300,8 +359,23 @@ async fn main() {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
+    let cpu_cores = num_cpus::get();
+    let max_concurrency = std::env::var("MOD_MAX_CONCURRENCY")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| (cpu_cores * 8).max(16).min(256));
+
+    let chunk_size = std::env::var("MOD_CHUNK_SIZE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| 32);
+
+    info!("系统配置 - CPU核心: {}, 最大并发: {}, 分块大小: {}", cpu_cores, max_concurrency, chunk_size);
+
     let state = Arc::new(AppState {
         version: "0.1.0".to_string(),
+        max_concurrency,
+        chunk_size,
     });
 
     let app = create_router(state);
@@ -313,7 +387,7 @@ async fn main() {
     info!("群聊消息审核服务启动，监听端口: 3000");
     info!("健康检查: http://localhost:3000/health");
     info!("审核接口: POST http://localhost:3000/api/v1/moderate");
-    info!("批量审核: POST http://localhost:3000/api/v1/moderate/batch");
+    info!("批量审核: POST http://localhost:3000/api/v1/moderate/batch (支持最多5000条/次，并发处理)");
 
     axum::serve(listener, app)
         .await
@@ -333,6 +407,8 @@ mod tests {
     fn test_state() -> Arc<AppState> {
         Arc::new(AppState {
             version: "test".to_string(),
+            max_concurrency: 8,
+            chunk_size: 16,
         })
     }
 
@@ -458,5 +534,122 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_batch_moderation_concurrent() {
+        let app = create_router(test_state());
+
+        let mut messages = Vec::new();
+        for i in 0..100 {
+            let content = if i % 5 == 0 {
+                format!("加微信user{}免费领取礼品", i)
+            } else if i % 7 == 0 {
+                format!("傻逼你好{}", i)
+            } else {
+                format!("正常消息内容 {}", i)
+            };
+            messages.push(GroupChatMessage {
+                group_id: format!("group_{}", i % 3),
+                user_id: format!("user_{}", i),
+                user_name: None,
+                message_id: Some(format!("msg_{}", i)),
+                content,
+                message_type: None,
+                timestamp: None,
+            });
+        }
+
+        let req = BatchModerationRequest { messages };
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/moderate/batch")
+                    .header(http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_string(&req).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body: ApiResponse<BatchModerationResponse> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body.code, 200);
+        let data = body.data.unwrap();
+        assert_eq!(data.total, 100);
+        assert!(data.violation_count > 0);
+        assert!(data.duration_ms < 5000);
+    }
+
+    #[tokio::test]
+    async fn test_batch_moderation_empty_list() {
+        let app = create_router(test_state());
+
+        let req = BatchModerationRequest { messages: vec![] };
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/moderate/batch")
+                    .header(http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_string(&req).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_batch_moderation_skips_empty_content() {
+        let app = create_router(test_state());
+
+        let messages = vec![
+            GroupChatMessage {
+                group_id: "g1".to_string(),
+                user_id: "u1".to_string(),
+                user_name: None,
+                message_id: None,
+                content: "".to_string(),
+                message_type: None,
+                timestamp: None,
+            },
+            GroupChatMessage {
+                group_id: "g1".to_string(),
+                user_id: "u2".to_string(),
+                user_name: None,
+                message_id: None,
+                content: "正常消息".to_string(),
+                message_type: None,
+                timestamp: None,
+            },
+        ];
+
+        let req = BatchModerationRequest { messages };
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/moderate/batch")
+                    .header(http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_string(&req).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body: ApiResponse<BatchModerationResponse> = serde_json::from_slice(&body).unwrap();
+        let data = body.data.unwrap();
+        assert_eq!(data.total, 1);
     }
 }
